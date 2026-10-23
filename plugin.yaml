@@ -1,0 +1,6 @@
+name: agentic_agency
+version: 0.1.0
+description: Agentic Agency runtime attribution and live reasoning bridge to the BFF
+provides_hooks:
+  - post_api_request
+  - on_stream_delta
