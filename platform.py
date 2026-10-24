@@ -1,0 +1,137 @@
+"""Host messaging-platform registration; all blocking work uses a worker thread."""
+
+import asyncio
+import json
+import logging
+
+from .delivery import Deliveries, middleware, parse_target
+
+logger = logging.getLogger(__name__)
+DESCRIPTION = (
+    "Proactively reach the user, for example from scheduled jobs or other channels. "
+    "Never use this tool to answer in the current app chat. A cron job's final answer "
+    "is already delivered; do not also notify with the same content. "
+    "Target inbox (default) or an existing app session id."
+)
+
+
+def notify(service, args, **kwargs):
+    try:
+        if not isinstance(args, dict):
+            raise ValueError("invalid arguments")
+        delivery_id = service.enqueue(args.get("target", "inbox"), args.get("message"), source="agent")
+        return json.dumps({"success": True, "delivery_id": delivery_id, "status": "queued"})
+    except Exception:
+        return json.dumps({"success": False, "error": "Delivery could not be queued; check target and plugin configuration"})
+
+
+def register_delivery(ctx, config, home, channel):
+    """Return None on unsupported hosts, without disturbing telemetry registrations."""
+    service = None
+    handles = []
+    def track(handle):
+        if handle is None:
+            raise ValueError("host registration not acquired")
+        handles.append(handle)
+        return handle
+    try:
+        import fcntl  # noqa: F401 - fail closed without cross-process spool locking
+        from hermes_state import SessionDB
+        from hermes_state_registry import acquire, release
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.platform_registry import PlatformEntry
+        required = ("register_platform", "register_middleware", "register_tool", "on_unload")
+        if (not all(callable(getattr(ctx, name, None)) for name in required)
+                or not callable(getattr(SessionDB, "append_completion_note", None))
+                or not callable(getattr(SessionDB, "resolve_resume_session_id", None))
+                or "cron_deliver_env_var" not in PlatformEntry.__dataclass_fields__):
+            raise ValueError("delivery APIs unavailable")
+        service = Deliveries(config, home, profile=getattr(ctx, "profile_name", "default"),
+                             on_inbox=lambda value: channel.set_delivery(True, value))
+        track(ctx.on_unload(service.stop))
+
+        class Adapter(BasePlatformAdapter):
+            splits_long_messages = True
+            MAX_MESSAGE_LENGTH = 128 * 1024
+
+            def __init__(self, platform_config):
+                super().__init__(config=platform_config, platform=Platform("agentic_agency"))
+
+            async def connect(self, *, is_reconnect=False):
+                try:
+                    self._mark_connected()
+                    return True
+                except Exception:
+                    return False
+
+            async def disconnect(self):
+                mark = getattr(self, "_mark_disconnected", None)
+                if callable(mark):
+                    mark()
+                else:
+                    self._running = False
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                try:
+                    delivery_id = await asyncio.to_thread(service.enqueue, chat_id, content, metadata)
+                    return SendResult(success=True, message_id=delivery_id)
+                except Exception:
+                    return SendResult(success=False, error="Agentic Agency delivery could not be queued")
+
+            async def get_chat_info(self, chat_id):
+                return {"name": "Assistant", "type": "dm", "id": chat_id}
+
+            async def _media(self, chat_id, path, metadata):
+                try:
+                    delivery_id = await asyncio.to_thread(service.enqueue_media, chat_id, path, metadata)
+                    return SendResult(success=True, message_id=delivery_id)
+                except Exception:
+                    return SendResult(success=False, error="Agentic Agency attachment could not be queued")
+
+            async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kwargs):
+                return await self._media(chat_id, image_path, metadata)
+
+            async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
+                return await self._media(chat_id, file_path, metadata)
+
+            async def send_video(self, chat_id, video_path, caption=None, reply_to=None, metadata=None, **kwargs):
+                return await self._media(chat_id, video_path, metadata)
+
+            async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
+                return await self._media(chat_id, audio_path, metadata)
+
+        track(ctx.register_platform("agentic_agency", "Assistant", Adapter, lambda: True,
+            validate_config=lambda value: True, is_connected=lambda value: True,
+            cron_deliver_env_var="AGENTIC_AGENCY_HOME_CHANNEL", parse_target_ref_fn=parse_target,
+            validate_target_ref_fn=service.validate, pii_safe=True, max_message_length=128 * 1024,
+            env_enablement_fn=lambda: {"home_channel": {"chat_id": "inbox", "name": "Assistant"}}))
+        track(ctx.register_middleware("tool_request", middleware))
+        track(ctx.register_tool("agentic_agency_notify", "agentic_agency", {
+            "name": "agentic_agency_notify", "description": DESCRIPTION,
+            "parameters": {"type": "object", "properties": {
+                "message": {"type": "string", "description": "Message to deliver"},
+                "target": {"type": "string", "description": "inbox or an app session id"}},
+                "required": ["message"], "additionalProperties": False}},
+            lambda args, **kwargs: notify(service, args, **kwargs), description=DESCRIPTION))
+        section = getattr(ctx, "register_system_prompt_section", None)
+        if callable(section):
+            track(section("agentic_agency.delivery", "Scheduled jobs created from an app chat deliver into that chat automatically. "
+                "Use deliver=\"agentic_agency\" for the user's Assistant inbox. "
+                "A cron job's final answer is already delivered; never also notify with the same content. "
+                "Files for the app must be shared with the app's media:// outbox convention inside the answer text "
+                "(as the agent rules describe), not as MEDIA: attachments."))
+        channel.set_delivery(True, service.inbox_session_id)
+        service.start()
+        return service
+    except Exception:
+        if service:
+            service.stop()
+        channel.set_delivery(False, None)
+        for handle in reversed(handles):
+            try:
+                handle.dispose()
+            except Exception:
+                pass
+        logger.warning("Agentic Agency delivery inert: host APIs or private delivery storage unavailable")
+        return None

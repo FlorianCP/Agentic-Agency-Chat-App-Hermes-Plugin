@@ -40,6 +40,8 @@ class Channel:
         self._backoff = 0.5
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         self.thread = None
+        self.delivery_platform = False
+        self.inbox_session_id = None
 
     def enqueue(self, event):
         # Fixed work per hook: no encoding, coalescing, file access, or network calls.
@@ -54,12 +56,20 @@ class Channel:
             self._reasoning_pending += event["type"] == "reasoning"
         self._wake.set()
 
+    def set_delivery(self, enabled, inbox_session_id):
+        with self._lock:
+            self.delivery_platform = enabled
+            self.inbox_session_id = inbox_session_id
+
     def hello(self):
         with self._lock:
             dropped = self.dropped
+            delivery_platform = self.delivery_platform
+            inbox_session_id = self.inbox_session_id
         return {"type": "hello", "ts": time.time(), "hooks": self.hooks,
                 **self.metadata, "stream_reasoning_deltas": self.stream_reasoning_deltas,
-                "dropped_events": dropped}
+                "dropped_events": dropped, "delivery_platform": delivery_platform,
+                "inbox_session_id": inbox_session_id}
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True, name="agentic-agency-bff")

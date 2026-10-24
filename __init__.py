@@ -78,10 +78,11 @@ def _hermes_version():
 
 
 def register(ctx, **kwargs):
-    """WP56 telemetry only; future platform/notes registrations can share this channel."""
+    """Register telemetry independently from optional scheduled delivery support."""
     channel = None
     try:
-        config = load_config(_home(ctx))
+        home = _home(ctx)
+        config = load_config(home)
         from hermes_cli.plugins import VALID_HOOKS
         available = [name for name in ("post_api_request", "on_stream_delta") if name in VALID_HOOKS]
         if not available or not callable(getattr(ctx, "on_unload", None)):
@@ -95,6 +96,8 @@ def register(ctx, **kwargs):
         for name in available:
             ctx.register_hook(name, getattr(observers, name))
             channel.hooks.append(name)
+        from .platform import register_delivery
+        register_delivery(ctx, config, home, channel)
         channel.start()
     except Exception:
         if channel is not None:
