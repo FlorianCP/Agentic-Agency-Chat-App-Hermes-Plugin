@@ -16,7 +16,21 @@ import uuid
 
 from .channel import _NoRedirect
 
-logger = logging.getLogger(__name__)
+# Hermes gateway.log admits hermes_plugins.* component loggers at INFO.
+logger = logging.getLogger("hermes_plugins.agentic_agency.delivery")
+
+
+def diagnostic(event, record=None, *, level=logging.INFO, **fields):
+    # Diagnostics must never change delivery behavior, even with a broken handler.
+    try:
+        keys = ("delivery_id", "session_id", "profile", "job_id", "job_name", "source")
+        value = {key: record[key] for key in keys if record and key in record}
+        value.update(event=event, **fields)
+        logger.log(level, json.dumps(value, ensure_ascii=True, separators=(",", ":"), default=str))
+    except Exception:
+        pass
+
+
 MAX_AGE = 24 * 60 * 60
 MAX_ATTEMPTS = 50
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
@@ -180,11 +194,13 @@ class Host:
     def append(self, record):
         with self.database() as db:
             session_id = self.resolve(record["session_id"])
-            db.append_completion_note(session_id, record["delivery_id"],
+            row_id = db.append_completion_note(session_id, record["delivery_id"],
                 transcript(record["text"], record["source"], record.get("job_name"), record.get("attachment", False)),
                 "agentic_agency_delivery", {"delivery_id": record["delivery_id"],
                     "source": record["source"], "job_id": record.get("job_id"),
                     "job_name": record.get("job_name")})
+            diagnostic("delivery.transcript_committed", record, message_id=str(row_id),
+                       outcome="duplicate" if record.get("transcript_written") else "written_or_duplicate")
             return session_id
 
     def job_name(self, job_id):
@@ -228,6 +244,7 @@ class Deliveries:
                 # Persist the chosen identity first so a crash cannot create orphan inboxes.
                 atomic_json(path, {"inbox_session_id": session_id})
                 self.host.create_inbox(session_id)
+                diagnostic("delivery.inbox_created", session_id=session_id, profile=self.profile)
             except ValueError:
                 # Complete an interrupted first-use creation with the same identity.
                 # Deleted/tombstoned identities may reject recreation; only then replace.
@@ -264,8 +281,14 @@ class Deliveries:
         # Hermes already applied its media-path policy. Retain the exact file
         # identity, then revalidate on drain rather than duplicate up to 20 MiB.
         path = str(Path(path).absolute())
-        with media_file(path) as source:
-            identity = media_identity(os.fstat(source.fileno()))
+        try:
+            with media_file(path) as source:
+                identity = media_identity(os.fstat(source.fileno()))
+        except Exception as error:
+            diagnostic("delivery.media_rejected", profile=self.profile, job_id=(metadata or {}).get("job_id"),
+                       session_id=(parse_target(target) or (None,))[0],
+                       reason="invalid_or_oversized_file", error_type=type(error).__name__)
+            raise
         return self.enqueue(target, "[attachment]", metadata, media={"path": path, "identity": identity})
 
     def enqueue(self, target, content, metadata=None, *, source=None, media=None):
@@ -311,6 +334,7 @@ class Deliveries:
                 count += 1
                 size += path.stat().st_size
                 if record.get("fingerprint") == fingerprint and now - record["created_at"] < DEDUP_SECONDS:
+                    diagnostic("delivery.spool_duplicate", record, ordering_key=path.name.split("-", 1)[0])
                     return record["delivery_id"]
             if count >= MAX_RECORDS or size + MAX_RECORD_BYTES > MAX_SPOOL_BYTES:
                 raise ValueError("delivery spool full")
@@ -328,13 +352,37 @@ class Deliveries:
                         if p.name.split("-", 1)[0].isdigit()), default=0)
             order = max(time.time_ns(), last + 1)
             atomic_json(self.spool / (f"{order:020d}-" + delivery_id + ".json"), record)
+        diagnostic("delivery.notify_accepted" if source == "agent" else "delivery.send_accepted", record,
+                   target_kind="inbox" if inbox else "session", requested_target=parse_target(target)[0],
+                   resolution_reason="profile_inbox" if inbox else
+                       ("compression_continuation" if parse_target(target)[0] != session_id else "explicit_session"))
+        diagnostic("delivery.spooled", record, ordering_key=str(order), target_kind="inbox" if inbox else "session",
+                   text_bytes=len(text.encode("utf-8")), attachment=bool(media), notify=record.get("notify", True),
+                   notify_reason="attachment" if media else "text_delivery", spool_count=count + 1)
         self._wake.set()
         return delivery_id
 
-    def post(self, path, body, content_type="application/json"):
+    def post(self, path, body, content_type="application/json", *, record=None):
+        request_id = uuid.uuid4().hex
         request = urllib.request.Request(self.url + path, data=body, method="POST", headers={
-            "Authorization": "Bearer " + self._secret, "Content-Type": content_type})
-        with self.opener.open(request, timeout=2) as response:
+            "Authorization": "Bearer " + self._secret, "Content-Type": content_type, "X-Request-ID": request_id})
+        if record:
+            for header, key in (("X-Delivery-ID", "delivery_id"), ("X-Session-ID", "session_id"),
+                                ("X-Delivery-Profile", "profile"), ("X-Delivery-Job-ID", "job_id")):
+                if record.get(key):
+                    request.add_header(header, record[key])
+        diagnostic("delivery.post_attempt", record, endpoint=path.split("?", 1)[0], attempt=(record or {}).get("attempts", 0) + 1, request_id=request_id)
+        try:
+            response = self.opener.open(request, timeout=2)
+        except Exception as error:
+            diagnostic("delivery.post_failed", record, endpoint=path.split("?", 1)[0],
+                       status=getattr(error, "code", None), error_type=type(error).__name__, request_id=request_id,
+                       attempt=(record or {}).get("attempts", 0) + 1)
+            raise
+        with response:
+            diagnostic("delivery.post_response", record, endpoint=path.split("?", 1)[0], status=response.status,
+                       request_id=request_id, server_request_id=response.headers.get("X-Request-ID"),
+                       attempt=(record or {}).get("attempts", 0) + 1)
             if response.status != 200:
                 raise OSError("BFF delivery not acknowledged")
             value = response.read(16 * 1024 + 1)
@@ -342,7 +390,7 @@ class Deliveries:
                 raise ValueError("BFF response too large")
             return json.loads(value)
 
-    def upload_media(self, path, *, max_bytes=MAX_MEDIA_BYTES, name=None):
+    def upload_media(self, path, *, max_bytes=MAX_MEDIA_BYTES, name=None, record=None):
         """Upload a host-policy-approved regular file with a bounded read."""
         with media_file(path, max_bytes=max_bytes) as source:
             identity = media_identity(os.fstat(source.fileno()))
@@ -352,17 +400,19 @@ class Deliveries:
         if len(body) > max_bytes:
             raise ValueError("media too large")
         result = self.post("/v1/plugin/media?" + urllib.parse.urlencode({"name": name or Path(path).name}),
-                           body, "application/octet-stream")
+                           body, "application/octet-stream", record=record)
         ref = result.get("ref")
         if not isinstance(ref, str) or not ref.startswith("media://deliveries/") or re.search(r"\s", ref):
             raise ValueError("invalid media reference")
+        diagnostic("delivery.media_uploaded", record, bytes=len(body), ref=ref)
         return ref
 
-    def drop(self, path, reason):
+    def drop(self, path, reason, record=None):
         with file_lock(self.root / "spool.lock"):
             path.unlink(missing_ok=True)
-        # Fixed reasons only: no content, paths, session IDs, or exception strings.
-        logger.warning("Agentic Agency delivery dropped: %s", reason)
+        diagnostic("delivery.dropped", record, level=logging.WARNING, reason=reason, attempts=(record or {}).get("attempts", 0),
+                   max_attempts=MAX_ATTEMPTS, age_seconds=max(0, int(time.time() - (record or {}).get("created_at", time.time()))),
+                   max_age_seconds=MAX_AGE)
 
     def drain(self):
         # Strict enqueue order per resolved session, including deferred retries.
@@ -375,14 +425,17 @@ class Deliveries:
                 if record.get("done"):
                     continue
                 if time.time() - record["created_at"] >= MAX_AGE or record["attempts"] >= MAX_ATTEMPTS:
-                    self.drop(path, "retry budget exhausted")
+                    self.drop(path, "retry budget exhausted", record)
                     continue
                 session = record["session_id"]
+                stage = "resolve_or_media"
                 try:
                     try:
                         record["session_id"] = self.host.resolve(session)
+                        if record["session_id"] != session:
+                            diagnostic("delivery.target_resolved", record, previous_session_id=session, reason="compression_continuation")
                     except ValueError:
-                        self.drop(path, "target unavailable")
+                        self.drop(path, "target unavailable", record)
                         continue
                     session = record["session_id"]
                     if session in blocked:
@@ -392,36 +445,52 @@ class Deliveries:
                         continue
                     if record.get("attachment") and not record.get("media_ref"):
                         media = record["media"]
+                        stage = "media_upload"
                         try:
                             with media_file(media["path"]) as source:
                                 if media_identity(os.fstat(source.fileno())) != media["identity"]:
                                     raise ValueError("media changed")
                                 # Upload the validated descriptor, avoiding a path-swap race.
-                                ref = self.upload_media(source, name=Path(media["path"]).name)
-                        except (ValueError, FileNotFoundError):
-                            self.drop(path, "attachment unavailable")
+                                ref = self.upload_media(source, name=Path(media["path"]).name, record=record)
+                        except (ValueError, FileNotFoundError) as error:
+                            diagnostic("delivery.media_rejected", record, reason="attachment_unavailable", error_type=type(error).__name__)
+                            self.drop(path, "attachment unavailable", record)
                             continue
                         record.update(media_ref=ref, text=ref, preview="[attachment]")
+                        stage = "media_marker"
                         with file_lock(self.root / "spool.lock"):
                             atomic_json(path, record)
+                    stage = "transcript"
                     record["session_id"] = self.host.append(record)
+                    record["transcript_written"] = True
+                    stage = "transcript_marker"
+                    with file_lock(self.root / "spool.lock"):
+                        atomic_json(path, record)
+                    stage = "receipt"
                     fields = ("delivery_id", "profile", "session_id", "inbox", "source", "job_id",
                               "job_name", "preview", "created_at", "notify")
                     body = json.dumps({k: record[k] for k in fields if k in record}, ensure_ascii=True).encode()
                     if len(body) > 16 * 1024:
                         raise ValueError("receipt too large")
-                    result = self.post("/v1/plugin/deliveries", body)
+                    result = self.post("/v1/plugin/deliveries", body, record=record)
                     if result.get("delivery_id") != record["delivery_id"] or "cursor" not in result:
                         raise ValueError("invalid delivery acknowledgement")
+                    diagnostic("delivery.acknowledged", record, cursor=result["cursor"], duplicate=result.get("duplicate", False))
                     record["done"] = True
                     for key in ("text", "preview", "media", "media_ref"):
                         record.pop(key, None)
-                except Exception:
+                except Exception as error:
+                    diagnostic("delivery.transcript_deferred" if stage == "transcript" else "delivery.attempt_failed", record,
+                               stage=stage, error_type=type(error).__name__, reason=("active_turn_lease" if "active turn lease" in str(error).lower() or str(error) == "live turn"
+                                       else "append_refused") if stage == "transcript" else "operation_failed")
                     record["attempts"] += 1
                     if record["attempts"] >= MAX_ATTEMPTS or time.time() - record["created_at"] >= MAX_AGE:
-                        self.drop(path, "retry budget exhausted")
+                        self.drop(path, "retry budget exhausted", record)
                         continue
                     record["retry_at"] = time.time() + min(0.5 * 2 ** min(record["attempts"], 6), 30)
+                    diagnostic("delivery.retry_scheduled", record, attempt=record["attempts"],
+                               backoff_seconds=min(0.5 * 2 ** min(record["attempts"], 6), 30), retry_at=record["retry_at"],
+                               max_attempts=MAX_ATTEMPTS, max_age_seconds=MAX_AGE)
                     blocked.add(session)
                 with file_lock(self.root / "spool.lock"):
                     atomic_json(path, record)
@@ -455,6 +524,10 @@ def middleware(tool_name="", args=None, session_id="", **kwargs):
                      or (args.get("action") == "update" and args.get("deliver") == "origin"))
                 and get_session_env("HERMES_SESSION_PLATFORM") == "api_server"
                 and TARGET.fullmatch(session_id)):
+            diagnostic("delivery.target_rewritten", session_id=session_id, job_id=args.get("job_id"),
+                       profile=kwargs.get("profile_name", "default"), action=args["action"],
+                       old_target=args.get("deliver"), new_target="agentic_agency:" + session_id,
+                       reason="api_server_origin")
             return {"args": {**args, "deliver": "agentic_agency:" + session_id}}
     except Exception:
         pass

@@ -17,6 +17,9 @@ and does three things for the app:
   Hermes v0.22.5 or newer; on older hosts this part stays inert and the rest keeps working.
   Only cron results and the notify tool reach the app: Hermes' own host notices (gateway
   online/restart pings, warnings) sent to the inbox home channel are dropped (since 0.2.1).
+  Every delivery step (target rewrite, spool, transcript write, BFF receipt, retries, drops) is
+  logged as one content-free JSON line keyed by `delivery_id` in Hermes' `gateway.log`, so a
+  delivery can be traced end to end together with the BFF and app logs (since 0.2.2).
 
 Events go to the BFF on localhost (`POST /v1/plugin/events`, `/v1/plugin/deliveries`,
 `/v1/plugin/media`) with a dedicated secret that is separate from the app's pairing token. A hook

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from .delivery import Deliveries, WRAPPER, middleware, parse_target, unwrap
+from .delivery import Deliveries, WRAPPER, diagnostic, middleware, parse_target, unwrap
 
 logger = logging.getLogger(__name__)
 CRON_MEDIA_WINDOW = 60
@@ -34,7 +34,8 @@ def notify(service, args, **kwargs):
             raise ValueError("invalid arguments")
         delivery_id = service.enqueue(args.get("target", "inbox"), args.get("message"), source="agent")
         return json.dumps({"success": True, "delivery_id": delivery_id, "status": "queued"})
-    except Exception:
+    except Exception as error:
+        diagnostic("delivery.notify_rejected", profile=getattr(service, "profile", ""), reason="enqueue_failed", error_type=type(error).__name__)
         return json.dumps({"success": False, "error": "Delivery could not be queued; check target and plugin configuration"})
 
 
@@ -98,7 +99,9 @@ def register_delivery(ctx, config, home, channel):
                         self._cron_media.pop(next(iter(self._cron_media)))
                     self._cron_media[chat_id] = (time.monotonic(), job_id)
                     return SendResult(success=True, message_id=delivery_id)
-                except Exception:
+                except Exception as error:
+                    diagnostic("delivery.send_rejected", profile=getattr(service, "profile", ""), job_id=str(job_id)[:128],
+                               session_id=(parse_target(chat_id) or (None,))[0], reason="enqueue_failed", error_type=type(error).__name__)
                     return SendResult(success=False, error="Agentic Agency delivery could not be queued")
 
             async def get_chat_info(self, chat_id):
@@ -122,6 +125,8 @@ def register_delivery(ctx, config, home, channel):
                 if not job_id and chat_id in self._cron_media:
                     job_id = self._cron_media[chat_id][1]
                 if not job_id:
+                    diagnostic("delivery.media_rejected", profile=getattr(service, "profile", ""),
+                               session_id=(parse_target(chat_id) or (None,))[0], reason="no_cron_identity_within_60s", window_seconds=CRON_MEDIA_WINDOW)
                     return self._ignore_host_send()
                 metadata = dict(metadata if isinstance(metadata, dict) else {}, job_id=job_id)
                 try:
@@ -147,7 +152,9 @@ def register_delivery(ctx, config, home, channel):
             cron_deliver_env_var="AGENTIC_AGENCY_HOME_CHANNEL", parse_target_ref_fn=parse_target,
             validate_target_ref_fn=service.validate, pii_safe=True, max_message_length=128 * 1024,
             env_enablement_fn=lambda: {"home_channel": {"chat_id": "inbox", "name": "Assistant"}}))
-        track(ctx.register_middleware("tool_request", middleware))
+        def delivery_middleware(*args, **kwargs):
+            return middleware(*args, **dict(kwargs, profile_name=getattr(ctx, "profile_name", "default")))
+        track(ctx.register_middleware("tool_request", delivery_middleware))
         track(ctx.register_tool("agentic_agency_notify", "agentic_agency", {
             "name": "agentic_agency_notify", "description": DESCRIPTION,
             "parameters": {"type": "object", "properties": {
