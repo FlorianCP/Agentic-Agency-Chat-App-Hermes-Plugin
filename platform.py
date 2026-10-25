@@ -3,10 +3,23 @@
 import asyncio
 import json
 import logging
+import time
 
-from .delivery import Deliveries, middleware, parse_target
+from .delivery import Deliveries, WRAPPER, middleware, parse_target, unwrap
 
 logger = logging.getLogger(__name__)
+CRON_MEDIA_WINDOW = 60
+
+
+def cron_job_id(content, metadata):
+    job_id = metadata.get("job_id") if isinstance(metadata, dict) else None
+    if job_id:
+        return job_id
+    if isinstance(content, str) and unwrap(content)[1]:
+        return WRAPPER.match(content)[2] or None
+    return None
+
+
 DESCRIPTION = (
     "Proactively reach the user, for example from scheduled jobs or other channels. "
     "Never use this tool to answer in the current app chat. A cron job's final answer "
@@ -57,6 +70,7 @@ def register_delivery(ctx, config, home, channel):
 
             def __init__(self, platform_config):
                 super().__init__(config=platform_config, platform=Platform("agentic_agency"))
+                self._cron_media = {}
 
             async def connect(self, *, is_reconnect=False):
                 try:
@@ -73,8 +87,16 @@ def register_delivery(ctx, config, home, channel):
                     self._running = False
 
             async def send(self, chat_id, content, reply_to=None, metadata=None):
+                job_id = cron_job_id(content, metadata)
+                if not job_id:
+                    return self._ignore_host_send()
+                metadata = dict(metadata if isinstance(metadata, dict) else {}, job_id=job_id)
                 try:
-                    delivery_id = await asyncio.to_thread(service.enqueue, chat_id, content, metadata)
+                    delivery_id = await asyncio.to_thread(service.enqueue, chat_id, content, metadata, source="cron")
+                    self._prune_cron_media()
+                    if len(self._cron_media) >= 500 and chat_id not in self._cron_media:
+                        self._cron_media.pop(next(iter(self._cron_media)))
+                    self._cron_media[chat_id] = (time.monotonic(), job_id)
                     return SendResult(success=True, message_id=delivery_id)
                 except Exception:
                     return SendResult(success=False, error="Agentic Agency delivery could not be queued")
@@ -82,7 +104,26 @@ def register_delivery(ctx, config, home, channel):
             async def get_chat_info(self, chat_id):
                 return {"name": "Assistant", "type": "dm", "id": chat_id}
 
+            def _ignore_host_send(self):
+                logger.info("Agentic Agency ignored non-cron host send")
+                return SendResult(success=True)
+
+            def _prune_cron_media(self):
+                now = time.monotonic()
+                self._cron_media = {chat: item for chat, item in self._cron_media.items()
+                                    if 0 <= now - item[0] <= CRON_MEDIA_WINDOW}
+
             async def _media(self, chat_id, path, metadata):
+                self._prune_cron_media()
+                job_id = cron_job_id(None, metadata)
+                # v0.22.5 cron sends files after text but omits job_id on files.
+                # Admit that fallback only for this chat within 60s of a durable
+                # cron text send; host notices never establish this window.
+                if not job_id and chat_id in self._cron_media:
+                    job_id = self._cron_media[chat_id][1]
+                if not job_id:
+                    return self._ignore_host_send()
+                metadata = dict(metadata if isinstance(metadata, dict) else {}, job_id=job_id)
                 try:
                     delivery_id = await asyncio.to_thread(service.enqueue_media, chat_id, path, metadata)
                     return SendResult(success=True, message_id=delivery_id)

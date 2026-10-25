@@ -1,5 +1,5 @@
 name: agentic_agency
-version: 0.2.0
+version: 0.2.1
 description: Agentic Agency runtime, reasoning, and scheduled delivery bridge
 provides_tools:
   - agentic_agency_notify

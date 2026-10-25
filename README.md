@@ -15,6 +15,8 @@ and does three things for the app:
   the user proactively. Deliveries are spooled durably, written into the chat's Hermes transcript
   (so the agent knows what it sent), and reported to the BFF, which sends the push. Requires
   Hermes v0.22.5 or newer; on older hosts this part stays inert and the rest keeps working.
+  Only cron results and the notify tool reach the app: Hermes' own host notices (gateway
+  online/restart pings, warnings) sent to the inbox home channel are dropped (since 0.2.1).
 
 Events go to the BFF on localhost (`POST /v1/plugin/events`, `/v1/plugin/deliveries`,
 `/v1/plugin/media`) with a dedicated secret that is separate from the app's pairing token. A hook
