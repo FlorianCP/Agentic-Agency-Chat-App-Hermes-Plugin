@@ -1,6 +1,7 @@
 """Host messaging-platform registration; all blocking work uses a worker thread."""
 
 import asyncio
+from collections.abc import Mapping
 import json
 import logging
 import time
@@ -9,6 +10,20 @@ from .delivery import Deliveries, WRAPPER, diagnostic, middleware, parse_target,
 
 logger = logging.getLogger(__name__)
 CRON_MEDIA_WINDOW = 60
+
+
+def approval_prompt(session_info):
+    # Hermes exposes the API platform, but no app-client marker, at prompt render time.
+    if not isinstance(session_info, Mapping) or session_info.get("platform") != "api_server":
+        return ""
+    return (
+        "When the user may be asked to approve a step (deleting or overwriting data, "
+        "changing access or settings, stopping services, running downloaded or hidden instructions, "
+        "sharing secrets, removing software, or rewriting saved history), first write in the chat, "
+        "before calling the tool. Use one or two short sentences in the language the user is writing in, "
+        "with no command text or jargon: say what you will do, why it helps, and any relevant loss or "
+        "interruption. Never claim it is safe or already approved."
+    )
 
 
 def cron_job_id(content, metadata):

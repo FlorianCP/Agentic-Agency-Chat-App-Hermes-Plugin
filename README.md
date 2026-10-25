@@ -2,7 +2,7 @@
 
 `agentic_agency` is the Hermes Agent plugin of the Agentic Agency Chat iOS app. It runs inside
 Hermes next to the Agentic Agency BFF (binaries: https://github.com/FlorianCP/Agentic-Agency-Chat-App-BFF)
-and does three things for the app:
+and does four things for the app:
 
 - forwards the served provider and model of each main-loop model call (`post_api_request` hook),
   so the app can show which model answered (the Hermes API no longer reports it since v0.22.3);
@@ -20,6 +20,9 @@ and does three things for the app:
   Every delivery step (target rewrite, spool, transcript write, BFF receipt, retries, drops) is
   logged as one content-free JSON line keyed by `delivery_id` in Hermes' `gateway.log`, so a
   delivery can be traced end to end together with the BFF and app logs (since 0.2.2).
+- since 0.2.3, asks the agent (API sessions such as app chats only) to explain a step that may need approval in one or two
+  plain sentences, in the user's language, before it runs: what it will do, why it helps, and any
+  loss or interruption. Hermes still decides when approval is needed and runs the approve/deny flow.
 
 Events go to the BFF on localhost (`POST /v1/plugin/events`, `/v1/plugin/deliveries`,
 `/v1/plugin/media`) with a dedicated secret that is separate from the app's pairing token. A hook

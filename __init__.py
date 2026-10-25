@@ -78,7 +78,23 @@ def _hermes_version():
 
 
 def register(ctx, **kwargs):
-    """Register telemetry independently from optional scheduled delivery support."""
+    """Register approvals, telemetry, and optional delivery independently."""
+    approval_section = None
+    try:
+        from .platform import approval_prompt
+        if not callable(getattr(ctx, "on_unload", None)):
+            raise ValueError("host lacks prompt lifecycle support")
+        approval_section = ctx.register_system_prompt_section("agentic_agency.approvals", approval_prompt)
+        if approval_section is None:
+            raise ValueError("host registration not acquired")
+        ctx.on_unload(approval_section.dispose)
+    except Exception:
+        if approval_section is not None:
+            try:
+                approval_section.dispose()
+            except Exception:
+                pass
+        logger.warning("Agentic Agency approvals unavailable: host prompt registration or lifecycle unsupported")
     channel = None
     try:
         home = _home(ctx)
